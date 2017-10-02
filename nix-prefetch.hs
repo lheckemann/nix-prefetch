@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 import System.Exit
+import System.Environment
 import Control.Applicative
 import Control.Applicative.Combinators
 import qualified Nix.Expr as N
@@ -9,14 +10,10 @@ import Data.Maybe
 import Data.Text (Text)
 import Data.List (intercalate, find)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.Lazy.Encoding as TL
 import System.Process.Typed
-import Data.ByteString (ByteString)
-import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
---import qualified Data.ByteString.Base16 as B16
 import qualified Text.Megaparsec as P
 import Text.Megaparsec.Error (parseErrorPretty)
 
@@ -37,7 +34,7 @@ refName = refPathComponent <++> (P.char '/' <:> (intercalate "/" <$> refPathComp
 
     -- Is character trivially rejectable?
     neverAccept :: Char -> Bool
-    neverAccept = isControl <||> isSpace <||> (flip elem ("~^:?*[\\" :: String))
+    neverAccept = isControl <||> isSpace <||> flip elem ("~^:?*[\\" :: String)
 
     -- Is character trivially acceptable?
     simpleChar :: Char -> Bool
@@ -67,13 +64,12 @@ getRef remote symbolicRef = do
   case P.parse (P.some lsRemoteLine <* P.eof) "git output" (TL.unpack $ TL.decodeUtf8 out) of
     (Left err) -> do putStr $ parseErrorPretty err; exitFailure
     (Right results) -> do
-      let (Just match) = find (isJust) (($ results) <$> lookup <$> refOptions symbolicRef)
+      let (Just match) = find isJust (($ results) . lookup <$> refOptions symbolicRef)
       let (Just sha) = match
       return sha
 
 instance P.ShowErrorComponent () where
   showErrorComponent = const ""
-
 
 class Fetchable a where
   fetchExpr :: a -> IO N.NExpr
@@ -87,18 +83,25 @@ data GitHubRepo = GitHubRepo
 instance Fetchable GitHubRepo where
   fetchExpr (GitHubRepo owner repo rev) =
     do
-      commitSha_ <- getRef ("https://github.com/" ++ T.unpack owner ++ "/" ++ T.unpack repo) (T.unpack rev)
+      let repoUrl = "https://github.com/" ++ T.unpack owner ++ "/" ++ T.unpack repo
+      commitSha_ <- getRef repoUrl (T.unpack rev)
       let (SHA commitSha) = commitSha_
+
+      (storePathHash_, _) <- readProcess_ $ proc "nix-prefetch-url" ["--unpack", repoUrl ++ "/archive/" ++ commitSha ++ ".tar.gz"]
+      let (Just storePathHash) = BL.stripSuffix "\n" storePathHash_
       return $ N.mkApp (N.mkSym "fetchFromGitHub") $
         N.mkNonRecSet
           [ N.NamedVar [N.StaticKey "owner"] (N.mkStr owner)
           , N.NamedVar [N.StaticKey "repo"] (N.mkStr repo)
           , N.NamedVar [N.StaticKey "rev"] (N.mkStr $ T.pack commitSha)
-          -- , NamedVar [StaticKey "sha256"] (mkStr $ T.pack sha)
+          , N.NamedVar [N.StaticKey "sha256"] (N.mkStr $ TL.toStrict $ TL.decodeUtf8 storePathHash)
           ]
 
 main :: IO ()
 main = do
-  expr <- fetchExpr $ GitHubRepo "nixos" "nixpkgs" "master"
+  owner:repo:args <- getArgs
+  let rev = case args of [] -> "master"
+                         (x:_) -> x
+  expr <- fetchExpr $ GitHubRepo (T.pack owner) (T.pack repo) (T.pack rev)
   print $ N.prettyNix expr
   return ()
