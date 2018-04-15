@@ -105,7 +105,7 @@ fetchGitLab base owner repo rev =
     (SHA commitSha) <- getRef (T.unpack repoUrl) (T.unpack rev)
     let downloadUrl = repoUrl <> "/repository/" <> T.pack commitSha <> "/archive.tar.bz2"
     storePathHash <- nixPrefetch (T.unpack downloadUrl)
-    return $ N.mkApp (N.mkSym "fetchurl") $
+    return $ N.mkApp (N.mkSym "fetchTarball") $
       N.mkNonRecSet
         [ N.NamedVar [N.StaticKey "url"] (N.mkStr downloadUrl)
         , N.NamedVar [N.StaticKey "sha256"] (N.mkStr storePathHash)
