@@ -1,8 +1,6 @@
 let
   pkgs = import <nixpkgs> {};
   ghc = pkgs.ghc.withPackages (ps: with ps; [
-    # Development
-    hdevtools ghc-mod 
     # Library deps
     hnix typed-process base16-bytestring megaparsec
     parser-combinators

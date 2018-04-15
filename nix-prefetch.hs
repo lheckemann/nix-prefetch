@@ -3,6 +3,7 @@ import System.Exit
 import System.Environment
 import Control.Applicative
 import Control.Applicative.Combinators
+import Control.Monad
 import qualified Nix.Expr as N
 import qualified Nix.Pretty as N
 import Data.Char
@@ -55,7 +56,11 @@ sha :: Parser SHA
 sha = SHA <$> count 40 (P.oneOf (['0'..'9'] ++ ['a'..'f'] :: String))
 
 lsRemoteLine :: Parser (String, SHA)
-lsRemoteLine = flip (,) <$> (sha <* P.char '\t') <*> (P.string "HEAD" <|> (P.string "refs/" <++> refName)) <* P.newline
+lsRemoteLine = do
+  hash <- sha <* P.char '\t'
+  name <- (P.string "HEAD" <|> (P.string "refs/" <++> refName)) <* P.newline
+  return (name, hash)
+
 
 refOptions :: String -> [String]
 refOptions s = [s, "refs/tags/" ++ s, "refs/heads/" ++ s]
@@ -66,67 +71,51 @@ getRef remote symbolicRef = do
   case P.parse (P.some lsRemoteLine <* P.eof) "git output" (TL.unpack $ TL.decodeUtf8 out) of
     (Left err) -> do putStr $ parseErrorPretty err; exitFailure
     (Right results) -> do
-      let (Just match) = find isJust (($ results) . lookup <$> refOptions symbolicRef)
-      let (Just sha) = match
+      let (Just sha) = join $ find isJust (flip lookup results <$> refOptions symbolicRef)
       return sha
 
 instance P.ShowErrorComponent () where
   showErrorComponent = const ""
 
-class Fetchable a where
-  fetchExpr :: a -> IO N.NExpr
+nixPrefetch :: String -> IO Text
+nixPrefetch url = do
+    (storePathHash_, _) <- readProcess_ $ proc "nix-prefetch-url" ["--unpack", url]
+    let (Just storePathHash) = BL.stripSuffix "\n" storePathHash_
+    return $ TL.toStrict $ TL.decodeUtf8 storePathHash
 
-data GitHubRepo = GitHubRepo
-  { ghOwner :: Text
-  , ghRepo :: Text
-  , ghRev :: Text
-  }
+fetchGitHub :: Text -> Text -> Text -> IO N.NExpr
+fetchGitHub owner repo rev =
+  do
+    let repoUrl = "https://github.com/" <> owner <> "/" <> repo
+    (SHA commitSha) <- getRef (T.unpack repoUrl) (T.unpack rev)
+    let downloadUrl = repoUrl <> "/archive/" <> T.pack commitSha <> ".tar.gz"
+    storePathHash <- nixPrefetch (T.unpack downloadUrl)
+    return $ N.mkApp (N.mkSym "fetchFromGitHub") $
+      N.mkNonRecSet
+        [ N.NamedVar [N.StaticKey "owner"] (N.mkStr owner)
+        , N.NamedVar [N.StaticKey "repo"] (N.mkStr repo)
+        , N.NamedVar [N.StaticKey "rev"] (N.mkStr $ T.pack commitSha)
+        , N.NamedVar [N.StaticKey "sha256"] (N.mkStr storePathHash)
+        ]
 
-instance Fetchable GitHubRepo where
-  fetchExpr (GitHubRepo owner repo rev) =
-    do
-      let repoUrl = "https://github.com/" <> owner <> "/" <> repo
-      commitSha_ <- getRef (T.unpack repoUrl) (T.unpack rev)
-      let (SHA commitSha) = commitSha_
-      let downloadUrl = repoUrl <> "/archive/" <> T.pack commitSha <> ".tar.gz"
+fetchGitLab :: Text -> Text -> Text -> Text -> IO N.NExpr
+fetchGitLab base owner repo rev =
+  do
+    let repoUrl = base <> owner <> "/" <> repo
+    (SHA commitSha) <- getRef (T.unpack repoUrl) (T.unpack rev)
+    let downloadUrl = repoUrl <> "/repository/" <> T.pack commitSha <> "/archive.tar.bz2"
+    storePathHash <- nixPrefetch (T.unpack downloadUrl)
+    return $ N.mkApp (N.mkSym "fetchurl") $
+      N.mkNonRecSet
+        [ N.NamedVar [N.StaticKey "url"] (N.mkStr downloadUrl)
+        , N.NamedVar [N.StaticKey "sha256"] (N.mkStr storePathHash)
+        ]
 
-      (storePathHash_, _) <- readProcess_ $ proc "nix-prefetch-url" ["--unpack", T.unpack downloadUrl]
-      let (Just storePathHash) = BL.stripSuffix "\n" storePathHash_
-      return $ N.mkApp (N.mkSym "fetchFromGitHub") $
-        N.mkNonRecSet
-          [ N.NamedVar [N.StaticKey "owner"] (N.mkStr owner)
-          , N.NamedVar [N.StaticKey "repo"] (N.mkStr repo)
-          , N.NamedVar [N.StaticKey "rev"] (N.mkStr $ T.pack commitSha)
-          , N.NamedVar [N.StaticKey "sha256"] (N.mkStr $ TL.toStrict $ TL.decodeUtf8 storePathHash)
-          ]
-
-data GitLabRepo = GitLabRepo
-  { glBase :: Text
-  , glOwner :: Text
-  , glRepo :: Text
-  , glRev :: Text
-  }
-
-instance Fetchable GitLabRepo where
-  fetchExpr (GitLabRepo base owner repo rev) =
-    do
-      let repoUrl = base <> owner <> "/" <> repo
-      commitSha_ <- getRef (T.unpack repoUrl) (T.unpack rev)
-      let (SHA commitSha) = commitSha_
-      let downloadUrl = repoUrl <> "/repository/" <> T.pack commitSha <> "/archive.tar.bz2"
-
-      (storePathHash_, _) <- readProcess_ $ proc "nix-prefetch-url" ["--unpack", T.unpack downloadUrl]
-      let (Just storePathHash) = BL.stripSuffix "\n" storePathHash_
-      return $ N.mkApp (N.mkSym "fetchurl") $
-        N.mkNonRecSet
-          [ N.NamedVar [N.StaticKey "url"] (N.mkStr downloadUrl)
-          , N.NamedVar [N.StaticKey "sha256"] (N.mkStr $ TL.toStrict $ TL.decodeUtf8 storePathHash)
-          ]
 main :: IO ()
 main = do
   owner:repo:args <- getArgs
   let rev = case args of [] -> "master"
                          (x:_) -> x
-  expr <- fetchExpr $ GitHubRepo (T.pack owner) (T.pack repo) (T.pack rev)
+  expr <- fetchGitHub (T.pack owner) (T.pack repo) (T.pack rev)
   print $ N.prettyNix expr
   return ()
